@@ -4,6 +4,13 @@
 
 微信 AI Agent 桥接器 — 将微信消息接入 AI Agent（Claude、Codex、Gemini、Kimi 等）。
 
+WeClaw 也可以通过渠道无关的 Native Message Service 协议连接任意 HTTP
+服务。Native 服务会收到稳定的微信账号、用户、会话、消息和附件信息，并可在
+原请求结束后通过鉴权接口主动发送消息。该协议不包含任何具体业务逻辑。
+
+配置和协议见 [Native Message Service](docs/native-services.md)，模块说明见
+[DETAILS.md](DETAILS.md)，开发状态见 [TODO.md](TODO.md)。
+
 > 本项目参考 [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin) 实现，仅限个人学习，勿做他用。
 
 |                                                 |                                                 |                                                 |

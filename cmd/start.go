@@ -158,12 +158,23 @@ func runStart(cmd *cobra.Command, args []string) error {
 	for _, c := range accounts {
 		clients = append(clients, ilink.NewClient(c))
 	}
+	var servicePolicies []api.ServicePolicy
+	for name, agCfg := range cfg.Agents {
+		if agCfg.Type != "native" || agCfg.OutboundToken == "" {
+			continue
+		}
+		servicePolicies = append(servicePolicies, api.ServicePolicy{
+			Name:         name,
+			Token:        agCfg.OutboundToken,
+			AllowedUsers: agCfg.AllowedUsers,
+		})
+	}
 	// Resolve API addr: flag > env/config > default
 	apiAddr := cfg.APIAddr // already includes env override from loadEnv
 	if apiAddrFlag != "" {
 		apiAddr = apiAddrFlag
 	}
-	apiServer := api.NewServer(clients, apiAddr)
+	apiServer := api.NewServer(clients, apiAddr, servicePolicies)
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)
@@ -274,6 +285,23 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			MaxHistory:   agCfg.MaxHistory,
 		})
 		log.Printf("[agent] created HTTP agent: %s (endpoint=%s, model=%s)", name, agCfg.Endpoint, agCfg.Model)
+		return ag
+	case "native":
+		if agCfg.Endpoint == "" {
+			log.Printf("[agent] native service %q has no endpoint", name)
+			return nil
+		}
+		if len(agCfg.AllowedUsers) == 0 {
+			log.Printf("[agent] native service %q has no allowed_users and will reject all senders", name)
+		}
+		ag := agent.NewNativeService(agent.NativeServiceConfig{
+			Endpoint:       agCfg.Endpoint,
+			APIKey:         agCfg.APIKey,
+			Headers:        agCfg.Headers,
+			AllowedUsers:   agCfg.AllowedUsers,
+			TimeoutSeconds: agCfg.TimeoutSeconds,
+		})
+		log.Printf("[agent] created native service: %s (endpoint=%s)", name, agCfg.Endpoint)
 		return ag
 	default:
 		log.Printf("[agent] unknown type %q for %q", agCfg.Type, name)

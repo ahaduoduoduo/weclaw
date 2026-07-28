@@ -39,9 +39,9 @@ type Handler struct {
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map   // map[userID]contextToken
-	saveDir       string     // directory to save images/files to
-	seenMsgs      sync.Map   // map[int64]time.Time — dedup by message_id
+	contextTokens sync.Map // map[userID]contextToken
+	saveDir       string   // directory to save images/files to
+	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
 }
 
 // NewHandler creates a new message handler.
@@ -286,6 +286,10 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 	}
 	if text == "" {
+		if _, ok := h.getDefaultAgent().(agent.MessageAgent); ok {
+			h.sendToDefaultAgent(ctx, client, msg, "", NewClientID())
+			return
+		}
 		// Check for image message
 		if img := extractImage(msg); img != nil && h.saveDir != "" {
 			h.handleImageSave(ctx, client, msg, img)
@@ -421,19 +425,19 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 	h.mu.RUnlock()
 
 	ag := h.getDefaultAgent()
-	var reply string
+	var replies []agent.OutboundMessage
 	if ag != nil {
 		var err error
-		reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, text)
+		replies, err = h.chatWithAgent(ctx, ag, client, msg, text)
 		if err != nil {
-			reply = fmt.Sprintf("Error: %v", err)
+			replies = []agent.OutboundMessage{{Type: "text", Text: fmt.Sprintf("Error: %v", err)}}
 		}
 	} else {
 		log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
-		reply = "[echo] " + text
+		replies = []agent.OutboundMessage{{Type: "text", Text: "[echo] " + text}}
 	}
 
-	h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+	h.sendStructuredReplies(ctx, client, msg, defaultName, replies, clientID)
 }
 
 // sendToNamedAgent sends the message to a specific agent and replies.
@@ -446,19 +450,19 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 		return
 	}
 
-	reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+	replies, err := h.chatWithAgent(ctx, ag, client, msg, message)
 	if err != nil {
-		reply = fmt.Sprintf("Error: %v", err)
+		replies = []agent.OutboundMessage{{Type: "text", Text: fmt.Sprintf("Error: %v", err)}}
 	}
-	h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
+	h.sendStructuredReplies(ctx, client, msg, name, replies, clientID)
 }
 
 // broadcastToAgents sends the message to multiple agents in parallel.
 // Each reply is sent as a separate message with the agent name prefix.
 func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, names []string, message string) {
 	type result struct {
-		name  string
-		reply string
+		name    string
+		replies []agent.OutboundMessage
 	}
 
 	ch := make(chan result, len(names))
@@ -467,24 +471,55 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 		go func(n string) {
 			ag, err := h.getAgent(ctx, n)
 			if err != nil {
-				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
+				ch <- result{
+					name: n,
+					replies: []agent.OutboundMessage{{
+						Type: "text",
+						Text: fmt.Sprintf("Error: %v", err),
+					}},
+				}
 				return
 			}
-			reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+			replies, err := h.chatWithAgent(ctx, ag, client, msg, message)
 			if err != nil {
-				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
+				ch <- result{name: n, replies: []agent.OutboundMessage{{Type: "text", Text: fmt.Sprintf("Error: %v", err)}}}
 				return
 			}
-			ch <- result{name: n, reply: reply}
+			ch <- result{name: n, replies: replies}
 		}(name)
 	}
 
 	// Send replies as they arrive
 	for range names {
 		r := <-ch
-		reply := fmt.Sprintf("[%s] %s", r.name, r.reply)
+		for i := range r.replies {
+			if r.replies[i].Text != "" {
+				r.replies[i].Text = fmt.Sprintf("[%s] %s", r.name, r.replies[i].Text)
+			}
+		}
 		clientID := NewClientID()
-		h.sendReplyWithMedia(ctx, client, msg, r.name, reply, clientID)
+		h.sendStructuredReplies(ctx, client, msg, r.name, r.replies, clientID)
+	}
+}
+
+func (h *Handler) sendStructuredReplies(
+	ctx context.Context,
+	client *ilink.Client,
+	msg ilink.WeixinMessage,
+	agentName string,
+	replies []agent.OutboundMessage,
+	clientID string,
+) {
+	for _, reply := range replies {
+		if reply.Text != "" {
+			h.sendReplyWithMedia(ctx, client, msg, agentName, reply.Text, clientID)
+			clientID = NewClientID()
+		}
+		if reply.MediaURL != "" {
+			if err := SendMediaFromURL(ctx, client, msg.FromUserID, reply.MediaURL, msg.ContextToken); err != nil {
+				log.Printf("[handler] failed to send structured media to %s: %v", msg.FromUserID, err)
+			}
+		}
 	}
 }
 
@@ -538,21 +573,38 @@ func (h *Handler) allowedAttachmentRoots(agentName string) []string {
 }
 
 // chatWithAgent sends a message to an agent and returns the reply, with logging.
-func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, message string) (string, error) {
+func (h *Handler) chatWithAgent(
+	ctx context.Context,
+	ag agent.Agent,
+	client *ilink.Client,
+	messageEvent ilink.WeixinMessage,
+	message string,
+) ([]agent.OutboundMessage, error) {
 	info := ag.Info()
-	log.Printf("[handler] dispatching to agent (%s) for %s", info, userID)
+	log.Printf("[handler] dispatching to agent (%s) for %s", info, messageEvent.FromUserID)
 
 	start := time.Now()
-	reply, err := ag.Chat(ctx, userID, message)
+	var replies []agent.OutboundMessage
+	var err error
+	if messageAgent, ok := ag.(agent.MessageAgent); ok {
+		replies, err = messageAgent.HandleMessage(
+			ctx,
+			buildNativeMessage(ctx, client, messageEvent, message),
+		)
+	} else {
+		var reply string
+		reply, err = ag.Chat(ctx, messageEvent.FromUserID, message)
+		replies = []agent.OutboundMessage{{Type: "text", Text: reply}}
+	}
 	elapsed := time.Since(start)
 
 	if err != nil {
 		log.Printf("[handler] agent error (%s, elapsed=%s): %v", info, elapsed, err)
-		return "", err
+		return nil, err
 	}
 
-	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))
-	return reply, nil
+	log.Printf("[handler] agent replied (%s, elapsed=%s, messages=%d)", info, elapsed, len(replies))
+	return replies, nil
 }
 
 // switchDefault switches the default agent. Starts it on demand if needed.

@@ -4,6 +4,16 @@
 
 WeChat AI Agent Bridge — connect WeChat to AI agents (Claude, Codex, Gemini, Kimi, etc.).
 
+WeClaw can also connect arbitrary HTTP services through its channel-neutral
+native message protocol. Native services receive stable account, user,
+conversation, message, and attachment data and can send authenticated proactive
+messages after the original request completes. The protocol contains no
+domain-specific behavior.
+
+See [Native message services](docs/native-services.md) for configuration and
+the wire contract, [DETAILS.md](DETAILS.md) for the module map, and
+[TODO.md](TODO.md) for current status.
+
 > This project is inspired by [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin). For personal learning only, not for commercial use.
 
 | | | |

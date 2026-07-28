@@ -86,6 +86,33 @@ func TestAgentConfigWithoutEnvStillLoads(t *testing.T) {
 	}
 }
 
+func TestNativeAgentConfiguration(t *testing.T) {
+	var cfg Config
+	data := []byte(`{
+		"agents": {
+			"movies": {
+				"type": "native",
+				"endpoint": "http://autofilm-core:3000/v1/conversation/events",
+				"api_key": "inbound-secret",
+				"outbound_token": "outbound-secret",
+				"allowed_users": ["user-1"],
+				"timeout_seconds": 180
+			}
+		}
+	}`)
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal native config: %v", err)
+	}
+	native := cfg.Agents["movies"]
+	if native.Type != "native" ||
+		native.OutboundToken != "outbound-secret" ||
+		native.TimeoutSeconds != 180 ||
+		len(native.AllowedUsers) != 1 {
+		t.Fatalf("native config = %#v", native)
+	}
+}
+
 func TestDefaultConfigInitializesAgentsMap(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Agents == nil {
