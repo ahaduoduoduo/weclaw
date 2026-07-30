@@ -48,7 +48,7 @@ type Handler struct {
 	factory         AgentFactory
 	saveDefault     SaveDefaultFunc
 	access          AccessController
-	contextTokens   sync.Map // map[userID]contextToken
+	contextTokens   *ContextTokenStore
 	saveDir         string   // directory to save images/files to
 	seenMsgs        sync.Map // map[int64]time.Time — dedup by message_id
 	lastSeenCleanup atomic.Int64
@@ -67,7 +67,17 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 		agentWorkDirs: make(map[string]string),
 		factory:       factory,
 		saveDefault:   saveDefault,
+		contextTokens: NewContextTokenStore(),
 	}
+}
+
+func (h *Handler) SetContextTokenStore(store *ContextTokenStore) {
+	if store == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.contextTokens = store
 }
 
 // SetSaveDir sets the directory for saving images and files.
@@ -322,6 +332,10 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	if msg.MessageState != ilink.MessageStateFinish {
 		return
 	}
+	h.mu.RLock()
+	contextTokens := h.contextTokens
+	h.mu.RUnlock()
+	contextTokens.Store(client.BotID(), msg.FromUserID, msg.ContextToken)
 
 	// Deduplicate by message_id to avoid processing the same message multiple times
 	// (voice messages may trigger multiple finish-state updates)
@@ -371,9 +385,6 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	}
 
 	log.Printf("[handler] received from %s: %q", msg.FromUserID, truncate(text, 80))
-
-	// Store context token for this user
-	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
 
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()

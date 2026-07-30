@@ -1,6 +1,6 @@
 # Repository structure
 
-Updated: 2026-07-29
+Updated: 2026-07-30
 
 - `agent/`
   - ACP, CLI, OpenAI-compatible HTTP, and native HTTP service clients.
@@ -10,8 +10,9 @@ Updated: 2026-07-29
     services.
 - `api/`
   - Legacy proactive send endpoint, authenticated native `/v1/messages`
-    endpoint, dynamic account selection, management API, embedded web assets,
-    administrator sessions, and health response.
+    endpoint, dynamic account selection, current context-token enforcement,
+    management API, embedded web assets, administrator sessions, and health
+    response.
 - `cmd/`
   - CLI lifecycle, login, service construction, and outbound policy setup.
 - `config/`
@@ -26,6 +27,8 @@ Updated: 2026-07-29
 - `messaging/`
   - WeChat message parsing, routing, media encryption/decryption, structured
     native message construction, and reply delivery.
+  - `context_tokens.go` shares process-local account/contact context tokens
+    between inbound message handling and proactive delivery.
 - `management/`
   - Browser administrator authentication, QR login sessions, dynamic account
     monitors, discovered contacts, unified Agent permissions, and per-user

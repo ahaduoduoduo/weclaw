@@ -86,6 +86,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 		},
 		runtimeConfig.SetDefaultAgent,
 	)
+	contextTokens := messaging.NewContextTokenStore()
+	handler.SetContextTokenStore(contextTokens)
 	handler.SetAccessController(access)
 	reloadHandler(handler, runtimeConfig)
 
@@ -118,6 +120,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		apiAddr = apiAddrFlag
 	}
 	apiServer := api.NewServer(nil, apiAddr, servicePolicies(runtimeConfig))
+	apiServer.SetContextTokenStore(contextTokens)
 	accounts := management.NewAccountManager(ctx, handler, apiServer.AddClient)
 	if err := accounts.Load(); err != nil {
 		return fmt.Errorf("load accounts: %w", err)

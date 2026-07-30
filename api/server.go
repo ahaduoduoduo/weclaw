@@ -28,12 +28,13 @@ type ServicePolicy struct {
 
 // Server provides legacy and channel-neutral outbound message APIs.
 type Server struct {
-	mu       sync.RWMutex
-	clients  []*ilink.Client
-	byBotID  map[string]*ilink.Client
-	addr     string
-	policies []ServicePolicy
-	admin    *AdminServices
+	mu            sync.RWMutex
+	clients       []*ilink.Client
+	byBotID       map[string]*ilink.Client
+	addr          string
+	policies      []ServicePolicy
+	admin         *AdminServices
+	contextTokens *messaging.ContextTokenStore
 }
 
 func (s *Server) SetAdmin(admin *AdminServices) {
@@ -44,6 +45,12 @@ func (s *Server) SetPolicies(policies []ServicePolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.policies = append([]ServicePolicy(nil), policies...)
+}
+
+func (s *Server) SetContextTokenStore(store *messaging.ContextTokenStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.contextTokens = store
 }
 
 func (s *Server) AddClient(client *ilink.Client) {
@@ -156,12 +163,34 @@ func (s *Server) handleNativeSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if err := sendMessages(r.Context(), client, req.To, req.Messages); err != nil {
+	contextToken, ok := s.contextToken(client.BotID(), req.To)
+	if !ok {
+		http.Error(
+			w,
+			"no current context token for this account and user",
+			http.StatusConflict,
+		)
+		return
+	}
+	if err := sendMessages(
+		r.Context(),
+		client,
+		req.To,
+		req.Messages,
+		contextToken,
+	); err != nil {
 		log.Printf("[api] native send failed for %s: %v", policy.Name, err)
 		http.Error(w, "send failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeOK(w)
+}
+
+func (s *Server) contextToken(accountID, userID string) (string, bool) {
+	s.mu.RLock()
+	store := s.contextTokens
+	s.mu.RUnlock()
+	return store.Load(accountID, userID)
 }
 
 func (s *Server) authorize(header string) (ServicePolicy, bool) {
@@ -212,15 +241,29 @@ func sendMessages(
 	client *ilink.Client,
 	to string,
 	messages []agent.OutboundMessage,
+	contextToken string,
 ) error {
 	for _, message := range messages {
 		if message.Text != "" {
-			if err := messaging.SendTextReply(ctx, client, to, message.Text, "", ""); err != nil {
+			if err := messaging.SendTextReply(
+				ctx,
+				client,
+				to,
+				message.Text,
+				contextToken,
+				"",
+			); err != nil {
 				return err
 			}
 		}
 		if message.MediaURL != "" {
-			if err := messaging.SendMediaFromURL(ctx, client, to, message.MediaURL, ""); err != nil {
+			if err := messaging.SendMediaFromURL(
+				ctx,
+				client,
+				to,
+				message.MediaURL,
+				contextToken,
+			); err != nil {
 				return err
 			}
 		}

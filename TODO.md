@@ -1,6 +1,6 @@
 # Development status
 
-Updated: 2026-07-29
+Updated: 2026-07-30
 
 ## Completed
 
@@ -26,6 +26,8 @@ Updated: 2026-07-29
   default per WeChat account/contact pair.
 - [x] 2026-07-29: Include the signed-in account instance in `/new` and `/clear`
   native reset events so Core can select and reset the correct channel session.
+- [x] 2026-07-30: Reuse the latest account/contact iLink context token for
+  proactive Native messages and return a retryable error when no token exists.
 
 ## Planned
 

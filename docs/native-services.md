@@ -1,6 +1,6 @@
 # Native message services
 
-Updated: 2026-07-28
+Updated: 2026-07-30
 
 Native services let WeClaw connect a WeChat account to any HTTP service without
 requiring that service to emulate an LLM API. The protocol carries stable user,
@@ -118,6 +118,13 @@ Content-Type: application/json
 
 The target must be in the native service's `allowed_users`. When
 `provider_instance_id` is omitted, WeClaw uses the first logged-in account.
+
+WeClaw keeps the latest iLink `context_token` in memory for each account and
+contact. Proactive text and media messages use that token. If no current token
+is available, `/v1/messages` returns HTTP 409 so the calling service can retry
+after the user sends another message. An empty token is never reported as a
+successful delivery, and context tokens are not written to the configuration
+file or a database.
 
 Keep the API on a private container network. Proactive delivery uses the
 authenticated `/v1/messages` endpoint.
