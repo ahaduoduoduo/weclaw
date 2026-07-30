@@ -27,8 +27,10 @@ outbound messages.
 }
 ```
 
-`allowed_users` is required for native services. An empty list rejects every
-sender. Use `["*"]` only on a trusted private deployment.
+`allowed_users` is used by WeClaw's common dispatcher for every Agent type.
+An empty list rejects every sender. The administration interface stores
+account-specific grants as `<provider_instance_id>:<sender_id>`. Use `["*"]`
+only when every discovered contact may use the Agent.
 
 `api_key` authenticates WeClaw to the service. `outbound_token` authenticates
 the service when it calls WeClaw's proactive message endpoint. Use different
@@ -87,6 +89,9 @@ The service returns zero or more messages:
 ```
 
 A `conversation.reset` event is sent when the user runs `/new` or `/clear`.
+The event carries the signed-in account's `provider_instance_id`, so a native
+service can reset the correct conversation when one WeClaw instance manages
+multiple accounts.
 
 ## Proactive messages
 
@@ -114,8 +119,12 @@ Content-Type: application/json
 The target must be in the native service's `allowed_users`. When
 `provider_instance_id` is omitted, WeClaw uses the first logged-in account.
 
-Keep the API on a private container network. The legacy `/api/send` endpoint is
-retained for compatibility and does not provide native service authorization.
+Keep the API on a private container network. Proactive delivery uses the
+authenticated `/v1/messages` endpoint.
+
+The configuration file is saved as `0640`. A local service that must discover
+native-service credentials may join the file's group and mount the directory
+read-only; do not expose the directory through a web server or public volume.
 
 ## Service boundaries
 

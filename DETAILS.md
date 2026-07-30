@@ -1,6 +1,6 @@
 # Repository structure
 
-Updated: 2026-07-28
+Updated: 2026-07-29
 
 - `agent/`
   - ACP, CLI, OpenAI-compatible HTTP, and native HTTP service clients.
@@ -10,17 +10,30 @@ Updated: 2026-07-28
     services.
 - `api/`
   - Legacy proactive send endpoint, authenticated native `/v1/messages`
-    endpoint, account selection, and health response.
+    endpoint, dynamic account selection, management API, embedded web assets,
+    administrator sessions, and health response.
 - `cmd/`
   - CLI lifecycle, login, service construction, and outbound policy setup.
 - `config/`
   - JSON configuration, environment overrides, aliases, native service
     allowlists, and separate inbound/outbound credentials.
+  - `runtime.go` provides synchronized Agent reads and atomic configuration
+    updates while the service is running.
+  - Saved configuration uses mode `0640` so an explicitly assigned container
+    service group can read a shared volume without making the file public.
 - `ilink/`
   - WeChat iLink protocol, credentials, monitoring, and message types.
 - `messaging/`
   - WeChat message parsing, routing, media encryption/decryption, structured
     native message construction, and reply delivery.
+- `management/`
+  - Browser administrator authentication, QR login sessions, dynamic account
+    monitors, discovered contacts, unified Agent permissions, and per-user
+    defaults.
+- `web/`
+  - Embedded standalone administration interface without a Node runtime.
+- `docs/administration.md`
+  - Account, Agent, contact permission, persistence, and security behavior.
 - `docs/native-services.md`
   - Native service protocol, security model, examples, and ownership boundary.
 - `Dockerfile`

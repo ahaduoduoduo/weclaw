@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
@@ -21,6 +22,13 @@ type AgentFactory func(ctx context.Context, name string) agent.Agent
 // SaveDefaultFunc persists the default agent name to config file.
 type SaveDefaultFunc func(name string) error
 
+type AccessController interface {
+	Observe(accountID, userID string)
+	Allowed(accountID, userID, agentName string) bool
+	DefaultAgent(accountID, userID, globalDefault string) string
+	SetDefaultAgent(accountID, userID, agentName string) error
+}
+
 // AgentMeta holds static config info about an agent (for /status display).
 type AgentMeta struct {
 	Name    string
@@ -31,17 +39,25 @@ type AgentMeta struct {
 
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
-	mu            sync.RWMutex
-	defaultName   string
-	agents        map[string]agent.Agent // name -> running agent
-	agentMetas    []AgentMeta            // all configured agents (for /status)
-	agentWorkDirs map[string]string      // agent name -> configured/runtime cwd
-	customAliases map[string]string      // custom alias -> agent name (from config)
-	factory       AgentFactory
-	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map // map[userID]contextToken
-	saveDir       string   // directory to save images/files to
-	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
+	mu              sync.RWMutex
+	defaultName     string
+	agents          map[string]agent.Agent // name -> running agent
+	agentMetas      []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs   map[string]string      // agent name -> configured/runtime cwd
+	customAliases   map[string]string      // custom alias -> agent name (from config)
+	factory         AgentFactory
+	saveDefault     SaveDefaultFunc
+	access          AccessController
+	contextTokens   sync.Map // map[userID]contextToken
+	saveDir         string   // directory to save images/files to
+	seenMsgs        sync.Map // map[int64]time.Time — dedup by message_id
+	lastSeenCleanup atomic.Int64
+}
+
+func (h *Handler) SetAccessController(access AccessController) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.access = access
 }
 
 // NewHandler creates a new message handler.
@@ -60,8 +76,8 @@ func (h *Handler) SetSaveDir(dir string) {
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
-func (h *Handler) cleanSeenMsgs() {
-	cutoff := time.Now().Add(-5 * time.Minute)
+func (h *Handler) cleanSeenMsgs(now time.Time) {
+	cutoff := now.Add(-5 * time.Minute)
 	h.seenMsgs.Range(func(key, value any) bool {
 		if t, ok := value.(time.Time); ok && t.Before(cutoff) {
 			h.seenMsgs.Delete(key)
@@ -92,6 +108,28 @@ func (h *Handler) SetAgentWorkDirs(workDirs map[string]string) {
 	h.agentWorkDirs = make(map[string]string, len(workDirs))
 	for name, dir := range workDirs {
 		h.agentWorkDirs[name] = dir
+	}
+}
+
+// ReloadConfiguration updates selectable agents and recreates them on next use.
+func (h *Handler) ReloadConfiguration(
+	defaultName string,
+	metas []AgentMeta,
+	workDirs map[string]string,
+	aliases map[string]string,
+) {
+	h.mu.Lock()
+	oldAgents := h.agents
+	h.agents = make(map[string]agent.Agent)
+	h.defaultName = defaultName
+	h.agentMetas = metas
+	h.agentWorkDirs = workDirs
+	h.customAliases = aliases
+	h.mu.Unlock()
+	for _, running := range oldAgents {
+		if stoppable, ok := running.(interface{ Stop() }); ok {
+			stoppable.Stop()
+		}
 	}
 }
 
@@ -146,6 +184,24 @@ func (h *Handler) getDefaultAgent() agent.Agent {
 		return nil
 	}
 	return h.agents[h.defaultName]
+}
+
+func (h *Handler) defaultAgentName(accountID, userID string) string {
+	h.mu.RLock()
+	global := h.defaultName
+	access := h.access
+	h.mu.RUnlock()
+	if access != nil {
+		return access.DefaultAgent(accountID, userID, global)
+	}
+	return global
+}
+
+func (h *Handler) agentAllowed(accountID, userID, name string) bool {
+	h.mu.RLock()
+	access := h.access
+	h.mu.RUnlock()
+	return access == nil || access.Allowed(accountID, userID, name)
 }
 
 // isKnownAgent checks if a name corresponds to a configured agent.
@@ -270,11 +326,22 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	// Deduplicate by message_id to avoid processing the same message multiple times
 	// (voice messages may trigger multiple finish-state updates)
 	if msg.MessageID != 0 {
-		if _, loaded := h.seenMsgs.LoadOrStore(msg.MessageID, time.Now()); loaded {
+		now := time.Now()
+		if _, loaded := h.seenMsgs.LoadOrStore(msg.MessageID, now); loaded {
 			return
 		}
-		// Clean up old entries periodically (fire-and-forget)
-		go h.cleanSeenMsgs()
+		lastCleanup := h.lastSeenCleanup.Load()
+		if now.Unix()-lastCleanup >= 60 &&
+			h.lastSeenCleanup.CompareAndSwap(lastCleanup, now.Unix()) {
+			h.cleanSeenMsgs(now)
+		}
+	}
+
+	h.mu.RLock()
+	access := h.access
+	h.mu.RUnlock()
+	if access != nil {
+		access.Observe(client.BotID(), msg.FromUserID)
 	}
 
 	// Extract text from item list (text message or voice transcription)
@@ -286,9 +353,13 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 	}
 	if text == "" {
-		if _, ok := h.getDefaultAgent().(agent.MessageAgent); ok {
-			h.sendToDefaultAgent(ctx, client, msg, "", NewClientID())
-			return
+		defaultName := h.defaultAgentName(client.BotID(), msg.FromUserID)
+		if h.agentAllowed(client.BotID(), msg.FromUserID, defaultName) {
+			defaultAgent, _ := h.getAgent(ctx, defaultName)
+			if _, ok := defaultAgent.(agent.MessageAgent); ok {
+				h.sendToDefaultAgent(ctx, client, msg, "", NewClientID())
+				return
+			}
 		}
 		// Check for image message
 		if img := extractImage(msg); img != nil && h.saveDir != "" {
@@ -342,7 +413,7 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 		return
 	} else if trimmed == "/new" || trimmed == "/clear" {
-		reply := h.resetDefaultSession(ctx, msg.FromUserID)
+		reply := h.resetDefaultSession(ctx, client.BotID(), msg.FromUserID)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 		}
@@ -367,7 +438,7 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	// No message -> switch default agent (only first name)
 	if message == "" {
 		if len(agentNames) == 1 && h.isKnownAgent(agentNames[0]) {
-			reply := h.switchDefault(ctx, agentNames[0])
+			reply := h.switchDefault(ctx, client.BotID(), msg.FromUserID, agentNames[0])
 			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 			}
@@ -386,13 +457,14 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	// Filter to known agents; if single unknown agent -> forward to default
 	var knownNames []string
 	for _, name := range agentNames {
-		if h.isKnownAgent(name) {
+		if h.isKnownAgent(name) &&
+			h.agentAllowed(client.BotID(), msg.FromUserID, name) {
 			knownNames = append(knownNames, name)
 		}
 	}
 	if len(knownNames) == 0 {
-		// No known agents -> forward entire text to default agent
-		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
+		_ = SendTextReply(ctx, client, msg.FromUserID,
+			"当前账号没有使用该 Agent 的权限。", msg.ContextToken, clientID)
 		return
 	}
 
@@ -420,21 +492,24 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 		}
 	}()
 
-	h.mu.RLock()
-	defaultName := h.defaultName
-	h.mu.RUnlock()
-
-	ag := h.getDefaultAgent()
+	defaultName := h.defaultAgentName(client.BotID(), msg.FromUserID)
+	if defaultName == "" || !h.agentAllowed(client.BotID(), msg.FromUserID, defaultName) {
+		h.sendStructuredReplies(ctx, client, msg, defaultName, []agent.OutboundMessage{{
+			Type: "text",
+			Text: "当前账号尚未分配可使用的默认 Agent。管理员可在 WeClaw 用户页面完成授权。",
+		}}, clientID)
+		return
+	}
+	ag, agentErr := h.getAgent(ctx, defaultName)
 	var replies []agent.OutboundMessage
-	if ag != nil {
+	if ag != nil && agentErr == nil {
 		var err error
 		replies, err = h.chatWithAgent(ctx, ag, client, msg, text)
 		if err != nil {
 			replies = []agent.OutboundMessage{{Type: "text", Text: fmt.Sprintf("Error: %v", err)}}
 		}
 	} else {
-		log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
-		replies = []agent.OutboundMessage{{Type: "text", Text: "[echo] " + text}}
+		replies = []agent.OutboundMessage{{Type: "text", Text: "默认 Agent 当前不可用。"}}
 	}
 
 	h.sendStructuredReplies(ctx, client, msg, defaultName, replies, clientID)
@@ -442,6 +517,11 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 
 // sendToNamedAgent sends the message to a specific agent and replies.
 func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, name, message, clientID string) {
+	if !h.agentAllowed(client.BotID(), msg.FromUserID, name) {
+		_ = SendTextReply(ctx, client, msg.FromUserID,
+			"当前账号没有使用该 Agent 的权限。", msg.ContextToken, clientID)
+		return
+	}
 	ag, agErr := h.getAgent(ctx, name)
 	if agErr != nil {
 		log.Printf("[handler] agent %q not available: %v", name, agErr)
@@ -607,43 +687,52 @@ func (h *Handler) chatWithAgent(
 	return replies, nil
 }
 
-// switchDefault switches the default agent. Starts it on demand if needed.
-// The change is persisted to config file.
-func (h *Handler) switchDefault(ctx context.Context, name string) string {
+// switchDefault changes the default agent for one account/contact pair.
+func (h *Handler) switchDefault(ctx context.Context, accountID, userID, name string) string {
+	if !h.agentAllowed(accountID, userID, name) {
+		return fmt.Sprintf("当前账号没有使用 %q 的权限。", name)
+	}
 	ag, err := h.getAgent(ctx, name)
 	if err != nil {
 		log.Printf("[handler] failed to switch default to %q: %v", name, err)
 		return fmt.Sprintf("Failed to switch to %q: %v", name, err)
 	}
 
-	h.mu.Lock()
-	old := h.defaultName
-	h.defaultName = name
-	h.agents[name] = ag
-	h.mu.Unlock()
-
-	// Persist to config file
-	if h.saveDefault != nil {
+	h.mu.RLock()
+	access := h.access
+	h.mu.RUnlock()
+	if access != nil {
+		if err := access.SetDefaultAgent(accountID, userID, name); err != nil {
+			return fmt.Sprintf("保存默认 Agent 失败: %v", err)
+		}
+	} else if h.saveDefault != nil {
 		if err := h.saveDefault(name); err != nil {
-			log.Printf("[handler] failed to save default agent to config: %v", err)
-		} else {
-			log.Printf("[handler] saved default agent %q to config", name)
+			return fmt.Sprintf("保存默认 Agent 失败: %v", err)
 		}
 	}
 
 	info := ag.Info()
-	log.Printf("[handler] switched default agent: %s -> %s (%s)", old, name, info)
+	log.Printf("[handler] user %s switched default agent to %s (%s)", userID, name, info)
 	return fmt.Sprintf("switch to %s", name)
 }
 
 // resetDefaultSession resets the session for the given userID on the default agent.
-func (h *Handler) resetDefaultSession(ctx context.Context, userID string) string {
-	ag := h.getDefaultAgent()
-	if ag == nil {
+func (h *Handler) resetDefaultSession(ctx context.Context, accountID, userID string) string {
+	name := h.defaultAgentName(accountID, userID)
+	if !h.agentAllowed(accountID, userID, name) {
 		return "No agent running."
 	}
-	name := ag.Info().Name
-	sessionID, err := ag.ResetSession(ctx, userID)
+	ag, agentErr := h.getAgent(ctx, name)
+	if agentErr != nil || ag == nil {
+		return "No agent running."
+	}
+	var sessionID string
+	var err error
+	if resetter, ok := ag.(agent.ProviderSessionResetter); ok {
+		sessionID, err = resetter.ResetProviderSession(ctx, accountID, userID)
+	} else {
+		sessionID, err = ag.ResetSession(ctx, userID)
+	}
 	if err != nil {
 		log.Printf("[handler] reset session failed for %s: %v", userID, err)
 		return fmt.Sprintf("Failed to reset session: %v", err)

@@ -50,6 +50,17 @@ type MessageAgent interface {
 	HandleMessage(ctx context.Context, message InboundMessage) ([]OutboundMessage, error)
 }
 
+// ProviderSessionResetter resets a conversation that belongs to a specific
+// messaging provider instance. Native services use this to distinguish the
+// same user or conversation ID across multiple signed-in accounts.
+type ProviderSessionResetter interface {
+	ResetProviderSession(
+		ctx context.Context,
+		providerInstanceID string,
+		conversationID string,
+	) (string, error)
+}
+
 // AgentInfo holds metadata about an agent for logging/debugging.
 type AgentInfo struct {
 	Name    string // e.g. "claude-acp", "claude", "gpt-4o"

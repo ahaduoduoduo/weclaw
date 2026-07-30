@@ -1,14 +1,69 @@
 package messaging
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/fastclaw-ai/weclaw/agent"
 )
 
+type providerResetAgent struct {
+	providerInstanceID string
+	conversationID     string
+}
+
+func (a *providerResetAgent) Chat(
+	_ context.Context,
+	_ string,
+	_ string,
+) (string, error) {
+	return "", nil
+}
+
+func (a *providerResetAgent) ResetSession(
+	_ context.Context,
+	_ string,
+) (string, error) {
+	return "", nil
+}
+
+func (a *providerResetAgent) ResetProviderSession(
+	_ context.Context,
+	providerInstanceID string,
+	conversationID string,
+) (string, error) {
+	a.providerInstanceID = providerInstanceID
+	a.conversationID = conversationID
+	return "", nil
+}
+
+func (a *providerResetAgent) Info() agent.AgentInfo {
+	return agent.AgentInfo{Name: "native", Type: "native"}
+}
+
+func (a *providerResetAgent) SetCwd(_ string) {}
+
 func newTestHandler() *Handler {
 	return &Handler{agents: make(map[string]agent.Agent)}
+}
+
+func TestResetDefaultSessionPassesProviderInstance(t *testing.T) {
+	nativeAgent := &providerResetAgent{}
+	h := newTestHandler()
+	h.defaultName = "autofilm"
+	h.agents["autofilm"] = nativeAgent
+
+	got := h.resetDefaultSession(context.Background(), "wechat-main", "user-1")
+	if got != "已创建新的autofilm会话" {
+		t.Fatalf("reply = %q", got)
+	}
+	if nativeAgent.providerInstanceID != "wechat-main" {
+		t.Fatalf("provider instance = %q", nativeAgent.providerInstanceID)
+	}
+	if nativeAgent.conversationID != "user-1" {
+		t.Fatalf("conversation = %q", nativeAgent.conversationID)
+	}
 }
 
 func TestParseCommand_NoPrefix(t *testing.T) {

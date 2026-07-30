@@ -64,6 +64,50 @@ func TestNativeServiceRejectsUnknownSender(t *testing.T) {
 	}
 }
 
+func TestNativeServiceResetProviderSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer inbound-secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+
+		var message InboundMessage
+		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if message.EventType != "conversation.reset" {
+			t.Fatalf("EventType = %q", message.EventType)
+		}
+		if message.ProviderInstanceID != "wechat-main" {
+			t.Fatalf("ProviderInstanceID = %q", message.ProviderInstanceID)
+		}
+		if message.ConversationID != "user-1" || message.SenderID != "user-1" {
+			t.Fatalf("unexpected conversation identity: %#v", message)
+		}
+		if message.MessageID == "" || message.EventID == "" {
+			t.Fatalf("reset identifiers are missing: %#v", message)
+		}
+		if len(message.Capabilities) != 1 ||
+			message.Capabilities[0] != "conversation.reset" {
+			t.Fatalf("Capabilities = %#v", message.Capabilities)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	service := NewNativeService(NativeServiceConfig{
+		Endpoint:     server.URL,
+		APIKey:       "inbound-secret",
+		AllowedUsers: []string{"user-1"},
+	})
+	if _, err := service.ResetProviderSession(
+		context.Background(),
+		"wechat-main",
+		"user-1",
+	); err != nil {
+		t.Fatalf("ResetProviderSession: %v", err)
+	}
+}
+
 func TestNativeServiceAllowsWildcard(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

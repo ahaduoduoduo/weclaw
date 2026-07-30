@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -117,6 +119,33 @@ func TestDefaultConfigInitializesAgentsMap(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Agents == nil {
 		t.Fatal("DefaultConfig() Agents = nil, want initialized map")
+	}
+}
+
+func TestSaveConfigAllowsReadOnlySharingWithServiceGroup(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := DefaultConfig()
+	cfg.DefaultAgent = "native"
+	cfg.Agents["native"] = AgentConfig{Type: "native"}
+	configDir := filepath.Join(home, ".weclaw")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config: %v", err)
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat config: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Fatalf("config mode = %o, want 640", got)
 	}
 }
 

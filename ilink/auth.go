@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	qrCodeURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
-	qrStatusURL   = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
-	statusWait     = "wait"
-	statusScanned  = "scaned"
+	qrCodeURL       = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
+	qrStatusURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
+	statusWait      = "wait"
+	statusScanned   = "scaned"
 	statusConfirmed = "confirmed"
-	statusExpired  = "expired"
+	statusExpired   = "expired"
 )
 
 // FetchQRCode retrieves a new QR code for login.
@@ -169,6 +169,21 @@ func LoadAllCredentials() ([]*Credentials, error) {
 		}
 	}
 	return result, nil
+}
+
+// DeleteCredentials removes one saved account and its sync cursor.
+func DeleteCredentials(botID string) error {
+	dir, err := AccountsDir()
+	if err != nil {
+		return err
+	}
+	base := filepath.Join(dir, NormalizeAccountID(botID))
+	for _, path := range []string{base + ".json", base + ".sync.json"} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // CredentialsPath returns the path for display purposes.

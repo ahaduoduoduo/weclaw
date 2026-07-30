@@ -66,7 +66,7 @@ func (s *NativeService) SetCwd(_ string) {}
 func (s *NativeService) Chat(ctx context.Context, conversationID, message string) (string, error) {
 	replies, err := s.HandleMessage(ctx, InboundMessage{
 		Version:        "2026-07-01",
-		EventID:        "compat:" + conversationID,
+		EventID:        fmt.Sprintf("compat:%s:%d", conversationID, time.Now().UnixNano()),
 		EventType:      "message.created",
 		Provider:       "wechat",
 		ConversationID: conversationID,
@@ -89,15 +89,31 @@ func (s *NativeService) Chat(ctx context.Context, conversationID, message string
 
 // ResetSession sends a channel-neutral reset event.
 func (s *NativeService) ResetSession(ctx context.Context, conversationID string) (string, error) {
+	return s.ResetProviderSession(ctx, "wechat", conversationID)
+}
+
+// ResetProviderSession sends a channel-neutral reset event for one signed-in
+// provider account. The provider instance is required by native services to
+// select the correct configured channel.
+func (s *NativeService) ResetProviderSession(
+	ctx context.Context,
+	providerInstanceID string,
+	conversationID string,
+) (string, error) {
+	now := time.Now().UTC()
+	messageID := "reset:" + fmt.Sprint(now.UnixNano())
 	_, err := s.HandleMessage(ctx, InboundMessage{
-		Version:        "2026-07-01",
-		EventID:        "reset:" + conversationID + ":" + fmt.Sprint(time.Now().UnixNano()),
-		EventType:      "conversation.reset",
-		Provider:       "wechat",
-		ConversationID: conversationID,
-		SenderID:       conversationID,
-		MessageType:    "control",
-		Timestamp:      time.Now().UTC(),
+		Version:            "2026-07-01",
+		EventID:            providerInstanceID + ":" + conversationID + ":" + messageID,
+		EventType:          "conversation.reset",
+		Provider:           "wechat",
+		ProviderInstanceID: providerInstanceID,
+		ConversationID:     conversationID,
+		SenderID:           conversationID,
+		MessageID:          messageID,
+		MessageType:        "control",
+		Timestamp:          now,
+		Capabilities:       []string{"conversation.reset"},
 	})
 	return "", err
 }

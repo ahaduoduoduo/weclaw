@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
@@ -27,10 +28,44 @@ type ServicePolicy struct {
 
 // Server provides legacy and channel-neutral outbound message APIs.
 type Server struct {
+	mu       sync.RWMutex
 	clients  []*ilink.Client
 	byBotID  map[string]*ilink.Client
 	addr     string
 	policies []ServicePolicy
+	admin    *AdminServices
+}
+
+func (s *Server) SetAdmin(admin *AdminServices) {
+	s.admin = admin
+}
+
+func (s *Server) SetPolicies(policies []ServicePolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policies = append([]ServicePolicy(nil), policies...)
+}
+
+func (s *Server) AddClient(client *ilink.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.byBotID[client.BotID()]; !exists {
+		s.clients = append(s.clients, client)
+	}
+	s.byBotID[client.BotID()] = client
+}
+
+func (s *Server) RemoveClient(botID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byBotID, botID)
+	next := s.clients[:0]
+	for _, client := range s.clients {
+		if client.BotID() != botID {
+			next = append(next, client)
+		}
+	}
+	s.clients = next
 }
 
 // NewServer creates an API server.
@@ -54,13 +89,6 @@ func NewServer(
 	}
 }
 
-// SendRequest is the JSON body for the legacy POST /api/send endpoint.
-type SendRequest struct {
-	To       string `json:"to"`
-	Text     string `json:"text,omitempty"`
-	MediaURL string `json:"media_url,omitempty"`
-}
-
 // NativeSendRequest is the channel-neutral proactive message request.
 type NativeSendRequest struct {
 	ProviderInstanceID string                  `json:"provider_instance_id,omitempty"`
@@ -71,12 +99,14 @@ type NativeSendRequest struct {
 // Run starts the HTTP server and blocks until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/send", s.handleSend)
 	mux.HandleFunc("/v1/messages", s.handleNativeSend)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	if s.admin != nil {
+		s.registerAdmin(mux)
+	}
 
 	srv := &http.Server{
 		Addr:              s.addr,
@@ -94,43 +124,6 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req SendRequest
-	if err := decodeJSON(w, r, &req); err != nil {
-		return
-	}
-	if req.To == "" {
-		http.Error(w, `"to" is required`, http.StatusBadRequest)
-		return
-	}
-	if req.Text == "" && req.MediaURL == "" {
-		http.Error(w, `"text" or "media_url" is required`, http.StatusBadRequest)
-		return
-	}
-
-	client, err := s.selectClient("")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	messages := []agent.OutboundMessage{{
-		Type:     "text",
-		Text:     req.Text,
-		MediaURL: req.MediaURL,
-	}}
-	if err := sendMessages(r.Context(), client, req.To, messages); err != nil {
-		log.Printf("[api] legacy send failed: %v", err)
-		http.Error(w, "send failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeOK(w)
 }
 
 func (s *Server) handleNativeSend(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +146,7 @@ func (s *Server) handleNativeSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `"to" and "messages" are required`, http.StatusBadRequest)
 		return
 	}
-	if !isAllowed(policy.AllowedUsers, req.To) {
+	if !isAllowed(policy.AllowedUsers, req.To, req.ProviderInstanceID) {
 		http.Error(w, "target is not allowed for this service", http.StatusForbidden)
 		return
 	}
@@ -172,6 +165,8 @@ func (s *Server) handleNativeSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authorize(header string) (ServicePolicy, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 	if token == "" {
 		return ServicePolicy{}, false
@@ -186,6 +181,8 @@ func (s *Server) authorize(header string) (ServicePolicy, bool) {
 }
 
 func (s *Server) selectClient(providerInstanceID string) (*ilink.Client, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if providerInstanceID != "" {
 		client := s.byBotID[providerInstanceID]
 		if client == nil {
@@ -231,8 +228,12 @@ func sendMessages(
 	return nil
 }
 
-func isAllowed(users []string, userID string) bool {
-	return slices.Contains(users, "*") || slices.Contains(users, userID)
+func isAllowed(users []string, userID string, accountID ...string) bool {
+	if slices.Contains(users, "*") || slices.Contains(users, userID) {
+		return true
+	}
+	return len(accountID) > 0 &&
+		slices.Contains(users, accountID[0]+":"+userID)
 }
 
 func writeOK(w http.ResponseWriter) {

@@ -11,8 +11,13 @@ messages after the original request completes. The protocol contains no
 domain-specific behavior.
 
 See [Native message services](docs/native-services.md) for configuration and
-the wire contract, [DETAILS.md](DETAILS.md) for the module map, and
+the wire contract, [Administration](docs/administration.md) for browser login
+and access control, [DETAILS.md](DETAILS.md) for the module map, and
 [TODO.md](TODO.md) for current status.
+
+WeClaw now includes a standalone dark administration interface on port `18011`.
+It provides browser QR login for multiple WeChat accounts, Agent configuration,
+discovered-contact approval, per-user Agent permissions, and per-user defaults.
 
 > This project is inspired by [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin). For personal learning only, not for commercial use.
 
@@ -30,11 +35,9 @@ curl -sSL https://raw.githubusercontent.com/fastclaw-ai/weclaw/main/install.sh |
 weclaw start
 ```
 
-That's it. On first start, WeClaw will:
-1. Show a QR code — scan with WeChat to login
-2. Auto-detect installed AI agents (Claude, Codex, Gemini, etc.)
-3. Save config to `~/.weclaw/config.json`
-4. Start receiving and replying to WeChat messages
+Open `http://127.0.0.1:18011`, create the administrator password, and add a
+WeChat account from the browser. Terminal `weclaw login` remains available for
+CLI-only installations.
 
 Use `weclaw login` to add additional WeChat accounts.
 
@@ -106,7 +109,8 @@ You can also define custom aliases per agent in config:
 
 Then `/ai hello` or `/c hello` will route to claude.
 
-Switching default agent is persisted to config — survives restarts.
+Switching the default Agent is saved for the current WeChat account/contact
+pair and survives restarts. It does not change other users' defaults.
 
 ## Media Messages
 
@@ -138,25 +142,6 @@ weclaw send --to "user_id@im.wechat" --text "Check this out" --media "https://ex
 weclaw send --to "user_id@im.wechat" --media "https://example.com/report.pdf"
 ```
 
-**HTTP API** (runs on `127.0.0.1:18011` when `weclaw start` is running):
-
-```bash
-# Send text
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "text": "Hello from weclaw"}'
-
-# Send image
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "media_url": "https://example.com/photo.png"}'
-
-# Send text + media
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "text": "See this", "media_url": "https://example.com/photo.png"}'
-```
-
 Supported media types: images (png, jpg, gif, webp), videos (mp4, mov), files (pdf, doc, zip, etc.).
 
 Set `WECLAW_API_ADDR` to change the listen address (e.g. `0.0.0.0:18011`).
@@ -164,6 +149,9 @@ Set `WECLAW_API_ADDR` to change the listen address (e.g. `0.0.0.0:18011`).
 ## Configuration
 
 Config file: `~/.weclaw/config.json`
+
+WeClaw saves this file as `0640`: only its owner can modify it, while an
+explicitly assigned service group may mount it read-only for local integration.
 
 ```json
 {

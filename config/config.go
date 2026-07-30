@@ -140,5 +140,8 @@ func Save(cfg *Config) error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0o600)
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o640)
 }
