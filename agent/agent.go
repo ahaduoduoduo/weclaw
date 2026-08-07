@@ -7,7 +7,59 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
+
+// Attachment is a channel-neutral inbound media item.
+type Attachment struct {
+	Type        string `json:"type"`
+	FileName    string `json:"file_name,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	DataBase64  string `json:"data_base64,omitempty"`
+	URL         string `json:"url,omitempty"`
+}
+
+// InboundMessage is the stable message envelope used by native HTTP services.
+type InboundMessage struct {
+	Version            string       `json:"version"`
+	EventID            string       `json:"event_id"`
+	EventType          string       `json:"event_type"`
+	Provider           string       `json:"provider"`
+	ProviderInstanceID string       `json:"provider_instance_id"`
+	ConversationID     string       `json:"conversation_id"`
+	SenderID           string       `json:"sender_id"`
+	MessageID          string       `json:"message_id"`
+	MessageType        string       `json:"message_type"`
+	Text               string       `json:"text,omitempty"`
+	Attachments        []Attachment `json:"attachments,omitempty"`
+	Timestamp          time.Time    `json:"timestamp"`
+	Capabilities       []string     `json:"capabilities,omitempty"`
+}
+
+// OutboundMessage is a channel-neutral reply returned by a native service.
+type OutboundMessage struct {
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	MediaURL  string `json:"media_url,omitempty"`
+	FileName  string `json:"file_name,omitempty"`
+	ReplyToID string `json:"reply_to_id,omitempty"`
+}
+
+// MessageAgent handles complete channel messages and can return structured replies.
+type MessageAgent interface {
+	HandleMessage(ctx context.Context, message InboundMessage) ([]OutboundMessage, error)
+}
+
+// ProviderSessionResetter resets a conversation that belongs to a specific
+// messaging provider instance. Native services use this to distinguish the
+// same user or conversation ID across multiple signed-in accounts.
+type ProviderSessionResetter interface {
+	ResetProviderSession(
+		ctx context.Context,
+		providerInstanceID string,
+		conversationID string,
+	) (string, error)
+}
 
 // AgentInfo holds metadata about an agent for logging/debugging.
 type AgentInfo struct {

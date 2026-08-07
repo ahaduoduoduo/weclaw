@@ -1,8 +1,19 @@
 # WeClaw
 
+WeClaw 内置独立管理界面，默认位于 `http://主机地址:18011`。管理界面支持浏览器
+扫码添加多个微信账号、Agent 配置、微信联系人审批、按用户分配 Agent，以及每个用户
+自己的默认 Agent。命令行 `weclaw login` 继续保留。
+
 [English](README.md)
 
 微信 AI Agent 桥接器 — 将微信消息接入 AI Agent（Claude、Codex、Gemini、Kimi 等）。
+
+WeClaw 也可以通过渠道无关的 Native Message Service 协议连接任意 HTTP
+服务。Native 服务会收到稳定的微信账号、用户、会话、消息和附件信息，并可在
+原请求结束后通过鉴权接口主动发送消息。该协议不包含任何具体业务逻辑。
+
+配置和协议见 [Native Message Service](docs/native-services.md)，模块说明见
+[DETAILS.md](DETAILS.md)，开发状态见 [TODO.md](TODO.md)。
 
 > 本项目参考 [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin) 实现，仅限个人学习，勿做他用。
 
@@ -129,25 +140,6 @@ weclaw send --to "user_id@im.wechat" --text "看看这个" --media "https://exam
 weclaw send --to "user_id@im.wechat" --media "https://example.com/report.pdf"
 ```
 
-**HTTP API**（`weclaw start` 运行时，默认监听 `127.0.0.1:18011`）：
-
-```bash
-# 发送文本
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "text": "你好，来自 weclaw"}'
-
-# 发送图片
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "media_url": "https://example.com/photo.png"}'
-
-# 发送文本 + 媒体
-curl -X POST http://127.0.0.1:18011/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "user_id@im.wechat", "text": "看看这个", "media_url": "https://example.com/photo.png"}'
-```
-
 支持的媒体类型：图片（png、jpg、gif、webp）、视频（mp4、mov）、文件（pdf、doc、zip 等）。
 
 设置 `WECLAW_API_ADDR` 环境变量可更改监听地址（如 `0.0.0.0:18011`）。
@@ -155,6 +147,9 @@ curl -X POST http://127.0.0.1:18011/api/send \
 ## 配置
 
 配置文件路径：`~/.weclaw/config.json`
+
+WeClaw 以 `0640` 权限保存该文件：只有所有者可以修改，明确加入同一服务组的
+本地集成服务可以只读挂载。
 
 ```json
 {

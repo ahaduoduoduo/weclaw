@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/fastclaw-ai/weclaw/api"
 	"github.com/fastclaw-ai/weclaw/config"
 	"github.com/fastclaw-ai/weclaw/ilink"
+	"github.com/fastclaw-ai/weclaw/management"
 	"github.com/fastclaw-ai/weclaw/messaging"
 	"github.com/mdp/qrterminal/v3"
 	"github.com/spf13/cobra"
@@ -34,44 +34,17 @@ func init() {
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start the WeChat message bridge (auto-login if needed)",
+	Short: "Start the WeChat message bridge and administration interface",
 	RunE:  runStart,
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
 	if !foregroundFlag {
-		// Check if login is needed — if so, do it in foreground first, then daemon
-		accounts, _ := ilink.LoadAllCredentials()
-		if len(accounts) == 0 {
-			fmt.Println("No WeChat accounts found, starting login...")
-			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-			_, err := doLogin(ctx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("login failed: %w", err)
-			}
-		}
 		return runDaemon()
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-
-	// Load all accounts
-	accounts, err := ilink.LoadAllCredentials()
-	if err != nil {
-		return fmt.Errorf("failed to load credentials: %w", err)
-	}
-
-	// No accounts — trigger login
-	if len(accounts) == 0 {
-		log.Println("No WeChat accounts found, starting login...")
-		creds, err := doLogin(ctx)
-		if err != nil {
-			return fmt.Errorf("login failed: %w", err)
-		}
-		accounts = append(accounts, creds)
-	}
 
 	// Load config and auto-detect agents
 	cfg, err := config.Load()
@@ -87,6 +60,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 			log.Printf("Auto-detected agents saved to %s", path)
 		}
 	}
+	runtimeConfig := config.NewRuntimeStore(cfg)
+	access, err := management.NewAccessStore(runtimeConfig)
+	if err != nil {
+		return fmt.Errorf("load access data: %w", err)
+	}
 
 	// Log all available agents
 	if len(cfg.Agents) > 0 {
@@ -100,37 +78,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Create handler with an agent factory for on-demand agent creation
 	handler := messaging.NewHandler(
 		func(ctx context.Context, name string) agent.Agent {
-			return createAgentByName(ctx, cfg, name)
+			agentConfig, ok := runtimeConfig.Agent(name)
+			if !ok {
+				return nil
+			}
+			return createAgent(ctx, name, agentConfig)
 		},
-		func(name string) error {
-			cfg.DefaultAgent = name
-			return config.Save(cfg)
-		},
+		runtimeConfig.SetDefaultAgent,
 	)
-
-	// Populate agent metas for /status
-	var metas []messaging.AgentMeta
-	workDirs := make(map[string]string, len(cfg.Agents))
-	for name, agCfg := range cfg.Agents {
-		command := agCfg.Command
-		if agCfg.Type == "http" {
-			command = agCfg.Endpoint
-		}
-		metas = append(metas, messaging.AgentMeta{
-			Name:    name,
-			Type:    agCfg.Type,
-			Command: command,
-			Model:   agCfg.Model,
-		})
-		if agCfg.Cwd != "" {
-			workDirs[name] = agCfg.Cwd
-		}
-	}
-	handler.SetAgentMetas(metas)
-	handler.SetAgentWorkDirs(workDirs)
-
-	// Load custom aliases from agent configs
-	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
+	contextTokens := messaging.NewContextTokenStore()
+	handler.SetContextTokenStore(contextTokens)
+	handler.SetAccessController(access)
+	reloadHandler(handler, runtimeConfig)
 
 	// Set save directory for images/files if configured
 	if cfg.SaveDir != "" {
@@ -140,51 +99,92 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// Start default agent initialization in background so monitors can start immediately
 	go func() {
-		if cfg.DefaultAgent == "" {
+		defaultName := runtimeConfig.DefaultAgent()
+		if defaultName == "" {
 			log.Println("No default agent configured, staying in echo mode")
 			return
 		}
-		log.Printf("Initializing default agent %q in background...", cfg.DefaultAgent)
-		ag := createAgentByName(ctx, cfg, cfg.DefaultAgent)
+		log.Printf("Initializing default agent %q in background...", defaultName)
+		agentConfig, _ := runtimeConfig.Agent(defaultName)
+		ag := createAgent(ctx, defaultName, agentConfig)
 		if ag == nil {
-			log.Printf("Failed to initialize default agent %q, staying in echo mode", cfg.DefaultAgent)
+			log.Printf("Failed to initialize default agent %q", defaultName)
 		} else {
-			handler.SetDefaultAgent(cfg.DefaultAgent, ag)
+			handler.SetDefaultAgent(defaultName, ag)
 		}
 	}()
 
-	// Start HTTP API server for sending messages
-	var clients []*ilink.Client
-	for _, c := range accounts {
-		clients = append(clients, ilink.NewClient(c))
-	}
 	// Resolve API addr: flag > env/config > default
 	apiAddr := cfg.APIAddr // already includes env override from loadEnv
 	if apiAddrFlag != "" {
 		apiAddr = apiAddrFlag
 	}
-	apiServer := api.NewServer(clients, apiAddr)
+	apiServer := api.NewServer(nil, apiAddr, servicePolicies(runtimeConfig))
+	apiServer.SetContextTokenStore(contextTokens)
+	accounts := management.NewAccountManager(ctx, handler, apiServer.AddClient)
+	if err := accounts.Load(); err != nil {
+		return fmt.Errorf("load accounts: %w", err)
+	}
+	auth, err := management.NewAuth()
+	if err != nil {
+		return fmt.Errorf("load administrator: %w", err)
+	}
+	logins := management.NewLoginManager(ctx, accounts)
+	apiServer.SetAdmin(&api.AdminServices{
+		Auth: auth, Configs: runtimeConfig, Access: access,
+		Accounts: accounts, Logins: logins,
+		OnAgentsChanged: func() {
+			reloadHandler(handler, runtimeConfig)
+			apiServer.SetPolicies(servicePolicies(runtimeConfig))
+		},
+		OnPoliciesChanged: func() {
+			apiServer.SetPolicies(servicePolicies(runtimeConfig))
+		},
+	})
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)
 		}
 	}()
 
-	// Start monitors immediately — they will use echo mode until agent is ready
-	log.Printf("Starting message bridge for %d account(s)...", len(accounts))
-
-	var wg sync.WaitGroup
-	for _, creds := range accounts {
-		wg.Add(1)
-		go func(c *ilink.Credentials) {
-			defer wg.Done()
-			runMonitorWithRestart(ctx, c, handler)
-		}(creds)
-	}
-
-	wg.Wait()
-	log.Println("All monitors stopped")
+	log.Printf("WeClaw administration is available on %s", apiAddr)
+	<-ctx.Done()
 	return nil
+}
+
+func reloadHandler(handler *messaging.Handler, configs *config.RuntimeStore) {
+	agents := configs.Agents()
+	metas := make([]messaging.AgentMeta, 0, len(agents))
+	workDirs := make(map[string]string, len(agents))
+	for name, value := range agents {
+		command := value.Command
+		if value.Type == "http" || value.Type == "native" {
+			command = value.Endpoint
+		}
+		metas = append(metas, messaging.AgentMeta{
+			Name: name, Type: value.Type, Command: command, Model: value.Model,
+		})
+		if value.Cwd != "" {
+			workDirs[name] = value.Cwd
+		}
+	}
+	handler.ReloadConfiguration(
+		configs.DefaultAgent(), metas, workDirs, configs.Aliases(),
+	)
+}
+
+func servicePolicies(configs *config.RuntimeStore) []api.ServicePolicy {
+	agents := configs.Agents()
+	policies := make([]api.ServicePolicy, 0, len(agents))
+	for name, value := range agents {
+		if value.Type == "native" && value.OutboundToken != "" {
+			policies = append(policies, api.ServicePolicy{
+				Name: name, Token: value.OutboundToken,
+				AllowedUsers: value.AllowedUsers,
+			})
+		}
+	}
+	return policies
 }
 
 // runMonitorWithRestart runs a monitor with automatic restart on failure.
@@ -223,15 +223,8 @@ func runMonitorWithRestart(ctx context.Context, creds *ilink.Credentials, handle
 	}
 }
 
-// createAgentByName creates and starts an agent by its config name.
-// Returns nil if the agent is not configured or fails to start.
-func createAgentByName(ctx context.Context, cfg *config.Config, name string) agent.Agent {
-	agCfg, ok := cfg.Agents[name]
-	if !ok {
-		log.Printf("[agent] %q not found in config", name)
-		return nil
-	}
-
+// createAgent creates and starts one agent from a synchronized config snapshot.
+func createAgent(ctx context.Context, name string, agCfg config.AgentConfig) agent.Agent {
 	switch agCfg.Type {
 	case "acp":
 		ag := agent.NewACPAgent(agent.ACPAgentConfig{
@@ -274,6 +267,23 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			MaxHistory:   agCfg.MaxHistory,
 		})
 		log.Printf("[agent] created HTTP agent: %s (endpoint=%s, model=%s)", name, agCfg.Endpoint, agCfg.Model)
+		return ag
+	case "native":
+		if agCfg.Endpoint == "" {
+			log.Printf("[agent] native service %q has no endpoint", name)
+			return nil
+		}
+		if len(agCfg.AllowedUsers) == 0 {
+			log.Printf("[agent] native service %q has no allowed_users and will reject all senders", name)
+		}
+		ag := agent.NewNativeService(agent.NativeServiceConfig{
+			Endpoint:       agCfg.Endpoint,
+			APIKey:         agCfg.APIKey,
+			Headers:        agCfg.Headers,
+			AllowedUsers:   []string{"*"},
+			TimeoutSeconds: agCfg.TimeoutSeconds,
+		})
+		log.Printf("[agent] created native service: %s (endpoint=%s)", name, agCfg.Endpoint)
 		return ag
 	default:
 		log.Printf("[agent] unknown type %q for %q", agCfg.Type, name)

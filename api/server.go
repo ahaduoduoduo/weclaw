@@ -2,50 +2,128 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/fastclaw-ai/weclaw/agent"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/fastclaw-ai/weclaw/messaging"
 )
 
-// Server provides an HTTP API for sending messages.
+const maxRequestBody = 8 << 20
+
+// ServicePolicy authorizes proactive messages from one native service.
+type ServicePolicy struct {
+	Name         string
+	Token        string
+	AllowedUsers []string
+}
+
+// Server provides legacy and channel-neutral outbound message APIs.
 type Server struct {
-	clients []*ilink.Client
-	addr    string
+	mu            sync.RWMutex
+	clients       []*ilink.Client
+	byBotID       map[string]*ilink.Client
+	addr          string
+	policies      []ServicePolicy
+	admin         *AdminServices
+	contextTokens *messaging.ContextTokenStore
+}
+
+func (s *Server) SetAdmin(admin *AdminServices) {
+	s.admin = admin
+}
+
+func (s *Server) SetPolicies(policies []ServicePolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policies = append([]ServicePolicy(nil), policies...)
+}
+
+func (s *Server) SetContextTokenStore(store *messaging.ContextTokenStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.contextTokens = store
+}
+
+func (s *Server) AddClient(client *ilink.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.byBotID[client.BotID()]; !exists {
+		s.clients = append(s.clients, client)
+	}
+	s.byBotID[client.BotID()] = client
+}
+
+func (s *Server) RemoveClient(botID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byBotID, botID)
+	next := s.clients[:0]
+	for _, client := range s.clients {
+		if client.BotID() != botID {
+			next = append(next, client)
+		}
+	}
+	s.clients = next
 }
 
 // NewServer creates an API server.
-func NewServer(clients []*ilink.Client, addr string) *Server {
+func NewServer(
+	clients []*ilink.Client,
+	addr string,
+	policies []ServicePolicy,
+) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:18011"
 	}
-	return &Server{clients: clients, addr: addr}
+	byBotID := make(map[string]*ilink.Client, len(clients))
+	for _, client := range clients {
+		byBotID[client.BotID()] = client
+	}
+	return &Server{
+		clients:  clients,
+		byBotID:  byBotID,
+		addr:     addr,
+		policies: policies,
+	}
 }
 
-// SendRequest is the JSON body for POST /api/send.
-type SendRequest struct {
-	To       string `json:"to"`
-	Text     string `json:"text,omitempty"`
-	MediaURL string `json:"media_url,omitempty"` // image/video/file URL
+// NativeSendRequest is the channel-neutral proactive message request.
+type NativeSendRequest struct {
+	ProviderInstanceID string                  `json:"provider_instance_id,omitempty"`
+	To                 string                  `json:"to"`
+	Messages           []agent.OutboundMessage `json:"messages"`
 }
 
-// Run starts the HTTP server. Blocks until ctx is cancelled.
+// Run starts the HTTP server and blocks until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/send", s.handleSend)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
+	mux.HandleFunc("/v1/messages", s.handleNativeSend)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	if s.admin != nil {
+		s.registerAdmin(mux)
+	}
 
-	srv := &http.Server{Addr: s.addr, Handler: mux}
+	srv := &http.Server{
+		Addr:              s.addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	go func() {
 		<-ctx.Done()
-		srv.Shutdown(context.Background())
+		_ = srv.Shutdown(context.Background())
 	}()
 
 	log.Printf("[api] listening on %s", s.addr)
@@ -55,65 +133,153 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNativeSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req SendRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+	policy, ok := s.authorize(r.Header.Get("Authorization"))
+	if !ok {
+		http.Error(w, "invalid service token", http.StatusUnauthorized)
 		return
 	}
 
-	if req.To == "" {
-		http.Error(w, `"to" is required`, http.StatusBadRequest)
+	var req NativeSendRequest
+	if err := decodeJSON(w, r, &req); err != nil {
 		return
 	}
-	if req.Text == "" && req.MediaURL == "" {
-		http.Error(w, `"text" or "media_url" is required`, http.StatusBadRequest)
+	if req.To == "" || len(req.Messages) == 0 {
+		http.Error(w, `"to" and "messages" are required`, http.StatusBadRequest)
+		return
+	}
+	if !isAllowed(policy.AllowedUsers, req.To, req.ProviderInstanceID) {
+		http.Error(w, "target is not allowed for this service", http.StatusForbidden)
 		return
 	}
 
-	if len(s.clients) == 0 {
-		http.Error(w, "no accounts configured", http.StatusServiceUnavailable)
+	client, err := s.selectClient(req.ProviderInstanceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	contextToken, ok := s.contextToken(client.BotID(), req.To)
+	if !ok {
+		http.Error(
+			w,
+			"no current context token for this account and user",
+			http.StatusConflict,
+		)
+		return
+	}
+	if err := sendMessages(
+		r.Context(),
+		client,
+		req.To,
+		req.Messages,
+		contextToken,
+	); err != nil {
+		log.Printf("[api] native send failed for %s: %v", policy.Name, err)
+		http.Error(w, "send failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeOK(w)
+}
 
-	// Use the first client
-	client := s.clients[0]
-	ctx := r.Context()
+func (s *Server) contextToken(accountID, userID string) (string, bool) {
+	s.mu.RLock()
+	store := s.contextTokens
+	s.mu.RUnlock()
+	return store.Load(accountID, userID)
+}
 
-	// Send text if provided
-	if req.Text != "" {
-		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, "", ""); err != nil {
-			log.Printf("[api] send text failed: %v", err)
-			http.Error(w, "send text failed: "+err.Error(), http.StatusInternalServerError)
-			return
+func (s *Server) authorize(header string) (ServicePolicy, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	if token == "" {
+		return ServicePolicy{}, false
+	}
+	for _, policy := range s.policies {
+		if len(token) == len(policy.Token) &&
+			subtle.ConstantTimeCompare([]byte(token), []byte(policy.Token)) == 1 {
+			return policy, true
 		}
-		log.Printf("[api] sent text to %s: %q", req.To, req.Text)
+	}
+	return ServicePolicy{}, false
+}
 
-		// Extract and send any markdown images embedded in text
-		for _, imgURL := range messaging.ExtractImageURLs(req.Text) {
-			if err := messaging.SendMediaFromURL(ctx, client, req.To, imgURL, ""); err != nil {
-				log.Printf("[api] send extracted image failed: %v", err)
-			} else {
-				log.Printf("[api] sent extracted image to %s: %s", req.To, imgURL)
+func (s *Server) selectClient(providerInstanceID string) (*ilink.Client, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if providerInstanceID != "" {
+		client := s.byBotID[providerInstanceID]
+		if client == nil {
+			return nil, fmt.Errorf("unknown provider_instance_id")
+		}
+		return client, nil
+	}
+	if len(s.clients) == 0 {
+		return nil, fmt.Errorf("no accounts configured")
+	}
+	return s.clients[0], nil
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return err
+	}
+	return nil
+}
+
+func sendMessages(
+	ctx context.Context,
+	client *ilink.Client,
+	to string,
+	messages []agent.OutboundMessage,
+	contextToken string,
+) error {
+	for _, message := range messages {
+		if message.Text != "" {
+			if err := messaging.SendTextReply(
+				ctx,
+				client,
+				to,
+				message.Text,
+				contextToken,
+				"",
+			); err != nil {
+				return err
+			}
+		}
+		if message.MediaURL != "" {
+			if err := messaging.SendMediaFromURL(
+				ctx,
+				client,
+				to,
+				message.MediaURL,
+				contextToken,
+			); err != nil {
+				return err
 			}
 		}
 	}
+	return nil
+}
 
-	// Send media if provided
-	if req.MediaURL != "" {
-		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, ""); err != nil {
-			log.Printf("[api] send media failed: %v", err)
-			http.Error(w, "send media failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("[api] sent media to %s: %s", req.To, req.MediaURL)
+func isAllowed(users []string, userID string, accountID ...string) bool {
+	if slices.Contains(users, "*") || slices.Contains(users, userID) {
+		return true
 	}
+	return len(accountID) > 0 &&
+		slices.Contains(users, accountID[0]+":"+userID)
+}
 
+func writeOK(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
