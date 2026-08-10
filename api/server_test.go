@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/fastclaw-ai/weclaw/agent"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/fastclaw-ai/weclaw/messaging"
 )
@@ -89,5 +91,48 @@ func TestNativeSendRejectsMissingContextToken(t *testing.T) {
 			response.Code,
 			response.Body.String(),
 		)
+	}
+}
+
+func TestPrepareMessagesRejectsUnavailableMedia(t *testing.T) {
+	mediaServer := httptest.NewServer(http.NotFoundHandler())
+	defer mediaServer.Close()
+
+	prepared, err := prepareMessages(context.Background(), []agent.OutboundMessage{
+		{Type: "text", Text: "authentication required"},
+		{Type: "image", MediaURL: mediaServer.URL + "/expired.png"},
+	})
+	if err == nil {
+		t.Fatal("prepareMessages() succeeded for unavailable media")
+	}
+	if prepared != nil {
+		t.Fatalf("prepared = %#v; want nil before delivery begins", prepared)
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("error = %q; want HTTP 404", err)
+	}
+}
+
+func TestPrepareMessagesDownloadsEveryAttachment(t *testing.T) {
+	requests := 0
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("png"))
+	}))
+	defer mediaServer.Close()
+
+	prepared, err := prepareMessages(context.Background(), []agent.OutboundMessage{
+		{Type: "text", Text: "authentication required"},
+		{Type: "image", MediaURL: mediaServer.URL + "/qr.png"},
+	})
+	if err != nil {
+		t.Fatalf("prepareMessages() error = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("media requests = %d; want 1", requests)
+	}
+	if len(prepared) != 2 || prepared[1].media == nil {
+		t.Fatalf("prepared = %#v; want staged media", prepared)
 	}
 }

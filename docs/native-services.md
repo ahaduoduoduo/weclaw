@@ -126,6 +126,10 @@ after the user sends another message. An empty token is never reported as a
 successful delivery, and context tokens are not written to the configuration
 file or a database.
 
+For proactive batches that contain remote media, WeClaw downloads every media
+item before sending the first message. An expired or unavailable media URL
+therefore fails the request before any preceding text is delivered repeatedly.
+
 Keep the API on a private container network. Proactive delivery uses the
 authenticated `/v1/messages` endpoint.
 
