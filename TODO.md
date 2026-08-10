@@ -1,6 +1,6 @@
 # Development status
 
-Updated: 2026-07-30
+Updated: 2026-08-10
 
 ## Completed
 
@@ -28,6 +28,8 @@ Updated: 2026-07-30
   native reset events so Core can select and reset the correct channel session.
 - [x] 2026-07-30: Reuse the latest account/contact iLink context token for
   proactive Native messages and return a retryable error when no token exists.
+- [x] 2026-08-10: Prepare remote media before proactive batch delivery so an
+  expired attachment cannot repeatedly deliver preceding text.
 
 ## Planned
 

@@ -34,12 +34,59 @@ func ExtractImageURLs(text string) []string {
 
 // SendMediaFromURL downloads a file from a URL and sends it as a media message.
 func SendMediaFromURL(ctx context.Context, client *ilink.Client, toUserID, mediaURL, contextToken string) error {
-	data, contentType, err := downloadFile(ctx, mediaURL)
+	media, err := PrepareMediaFromURL(ctx, mediaURL)
 	if err != nil {
-		return fmt.Errorf("download %s: %w", mediaURL, err)
+		return err
 	}
 
-	return sendMediaData(ctx, client, toUserID, filenameFromURL(mediaURL), mediaURL, data, contentType, contextToken)
+	return SendPreparedMedia(ctx, client, toUserID, media, contextToken)
+}
+
+// PreparedMedia contains media downloaded before a multi-message delivery
+// starts. Preparing every remote attachment first prevents a later download
+// failure from leaving the preceding text messages partially delivered.
+type PreparedMedia struct {
+	FileName    string
+	Source      string
+	Data        []byte
+	ContentType string
+}
+
+// PrepareMediaFromURL downloads remote media without sending it to WeChat.
+func PrepareMediaFromURL(ctx context.Context, mediaURL string) (*PreparedMedia, error) {
+	data, contentType, err := downloadFile(ctx, mediaURL)
+	if err != nil {
+		return nil, fmt.Errorf("download %s: %w", mediaURL, err)
+	}
+	return &PreparedMedia{
+		FileName:    filenameFromURL(mediaURL),
+		Source:      mediaURL,
+		Data:        data,
+		ContentType: contentType,
+	}, nil
+}
+
+// SendPreparedMedia uploads previously downloaded media and sends it to WeChat.
+func SendPreparedMedia(
+	ctx context.Context,
+	client *ilink.Client,
+	toUserID string,
+	media *PreparedMedia,
+	contextToken string,
+) error {
+	if media == nil {
+		return fmt.Errorf("prepared media is nil")
+	}
+	return sendMediaData(
+		ctx,
+		client,
+		toUserID,
+		media.FileName,
+		media.Source,
+		media.Data,
+		media.ContentType,
+		contextToken,
+	)
 }
 
 // SendMediaFromPath reads a local file and sends it as a media message.

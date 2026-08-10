@@ -243,7 +243,12 @@ func sendMessages(
 	messages []agent.OutboundMessage,
 	contextToken string,
 ) error {
-	for _, message := range messages {
+	prepared, err := prepareMessages(ctx, messages)
+	if err != nil {
+		return err
+	}
+	for _, item := range prepared {
+		message := item.message
 		if message.Text != "" {
 			if err := messaging.SendTextReply(
 				ctx,
@@ -256,12 +261,12 @@ func sendMessages(
 				return err
 			}
 		}
-		if message.MediaURL != "" {
-			if err := messaging.SendMediaFromURL(
+		if item.media != nil {
+			if err := messaging.SendPreparedMedia(
 				ctx,
 				client,
 				to,
-				message.MediaURL,
+				item.media,
 				contextToken,
 			); err != nil {
 				return err
@@ -269,6 +274,30 @@ func sendMessages(
 		}
 	}
 	return nil
+}
+
+type preparedMessage struct {
+	message agent.OutboundMessage
+	media   *messaging.PreparedMedia
+}
+
+func prepareMessages(
+	ctx context.Context,
+	messages []agent.OutboundMessage,
+) ([]preparedMessage, error) {
+	prepared := make([]preparedMessage, 0, len(messages))
+	for _, message := range messages {
+		item := preparedMessage{message: message}
+		if message.MediaURL != "" {
+			media, err := messaging.PrepareMediaFromURL(ctx, message.MediaURL)
+			if err != nil {
+				return nil, err
+			}
+			item.media = media
+		}
+		prepared = append(prepared, item)
+	}
+	return prepared, nil
 }
 
 func isAllowed(users []string, userID string, accountID ...string) bool {
